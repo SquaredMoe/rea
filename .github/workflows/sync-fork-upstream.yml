@@ -1,8 +1,11 @@
 name: Daily Safe Upstream Sync
 on:
   schedule:
-    - cron: "15 7 * * *"
+    - cron: "16 7 * * *"
   workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/sync-fork-upstream.yml
 
 permissions:
   contents: write
@@ -56,16 +59,42 @@ jobs:
 
           # GitHub's built-in GITHUB_TOKEN cannot update .github/workflows files.
           # Merge new upstream code, but keep our existing workflow definitions.
+          # Keep fork workflow definitions when Git conflicts with upstream.
+          # Abort if ANY source, documentation or generated file conflicts.
           if ! git merge --no-commit --no-ff refs/remotes/upstream/auto-sync; then
-            git merge --abort || true
-            echo "Conflict merging ${parent} into ${TARGET_BRANCH}. No changes pushed; resolve manually." >> "${GITHUB_STEP_SUMMARY}"
-            exit 1
+            mapfile -d '' -t conflicts < <(git diff --name-only --diff-filter=U -z)
+            if (( ${#conflicts[@]} == 0 )); then
+              git merge --abort || true
+              echo "Merge failed unexpectedly; no changes pushed." >> "${GITHUB_STEP_SUMMARY}"
+              exit 1
+            fi
+            for path in "${conflicts[@]}"; do
+              case "${path}" in
+                .github/workflows/*) ;;
+                *)
+                  git merge --abort || true
+                  echo "Manual review required for source conflict: ${path}" >> "${GITHUB_STEP_SUMMARY}"
+                  exit 1
+                  ;;
+              esac
+            done
+            for path in "${conflicts[@]}"; do
+              if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+                git restore --source=HEAD --staged --worktree -- "${path}"
+              else
+                git rm -f -- "${path}"
+              fi
+            done
           fi
 
           workflow_changes="$(git diff --cached --name-only -- .github/workflows | wc -l)"
+          git restore --source=HEAD --staged --worktree -- .github/workflows
           if (( workflow_changes > 0 )); then
-            git restore --source=HEAD --staged --worktree -- .github/workflows
-            echo "Preserved ${workflow_changes} local workflow file(s): upstream workflow updates skipped because GITHUB_TOKEN lacks Workflows permission." >> "${GITHUB_STEP_SUMMARY}"
+            echo "Preserved the fork's workflow files." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            git merge --abort || true
+            exit 1
           fi
 
           git commit -m "chore(sync): merge upstream changes"
